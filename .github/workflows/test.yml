@@ -39,7 +39,8 @@ jobs:
       #     - keys/server.key
 
     - name: Generate Delta Changes (HEAD~1)
-      # uses: docker://rodolforicojr/salesforce-tools
+      uses: docker://rodolforicojr/salesforce-tools
+    - name: Generate Delta Changes (HEAD~1)
       run: |
         mkdir changed-sources
         sfdx sgd:source:delta --to "HEAD" --from "HEAD~1" --output changed-sources --generate-delta
