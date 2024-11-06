@@ -45,7 +45,7 @@ jobs:
         sfdx sgd:source:delta --to "HEAD" --from "HEAD~1" --output changed-sources --generate-delta
       # with:
       #   artifacts:
-      #     - changed-sources/**
+      #    - changed-sources/**
 
     - name: Generate Delta Changes (origin/master)
       # uses: docker://rodolforicojr/salesforce-tools
