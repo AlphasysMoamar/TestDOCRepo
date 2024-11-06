@@ -1,0 +1,353 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - develop
+      - master
+  pull_request:
+    branches:
+      - feature/**
+      - bugfix/**
+      - release/**
+      - hotfix/**
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      with:
+        lfs: false
+        fetch-depth: 0
+
+    - name: Set up Docker
+      if: ${{ github.event_name == 'push' }}
+      uses: docker/setup-buildx-action@v1
+
+    - name: Decrypt private key
+      run: |
+        openssl enc -nosalt -aes-256-cbc -d -in keys/server.key.enc -out keys/server.key -base64 -k ${{ secrets.DECRYPTION_KEY }} -md md5
+      continue-on-error: true
+      env:
+        DECRYPTION_KEY: ${{ secrets.DECRYPTION_KEY }}
+      with:
+        artifacts:
+          - keys/server.key
+
+    - name: Generate Delta Changes (HEAD~1)
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "HEAD~1" --output changed-sources --generate-delta
+      with:
+        artifacts:
+          - changed-sources/**
+
+    - name: Generate Delta Changes (origin/master)
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "origin/master" --output changed-sources --generate-delta
+      with:
+        artifacts:
+          - changed-sources/**
+
+    - name: Generate Delta Changes (origin/develop)
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "origin/develop" --output changed-sources --generate-delta
+      with:
+        artifacts:
+          - changed-sources/**
+
+    - name: Apex Static Code Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/apex
+        sfdx scanner:run --format=junit --outfile="test-reports/apex/junit.xml" --target 'changed-sources/**/*.cls,!./**/lwc/**,!./**/aura/**' --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: Aura Static Code Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/aura
+        sfdx scanner:run --engine "eslint,retire-js" --format=junit --outfile="test-reports/aura/junit.xml" --target changed-sources/**/aura/**/*.js --eslintconfig force-app/main/default/aura/.eslintrc.json --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: LWC Static Code Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/lwc
+        sfdx scanner:run --engine "eslint-lwc,retire-js" --format=junit --outfile="test-reports/lwc/junit.xml" --target changed-sources/**/lwc/**/*.js --eslintconfig force-app/main/default/lwc/.eslintrc.json --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+    - name: Code formatting verification
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        npm run prettier:verify
+
+    - name: Lint Lightning Web Components / Aura Components
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        npm run lint
+
+    - name: Unit test Lightning Web Components
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        npm run test:unit:coverage
+      with:
+        artifacts:
+          - coverage/**
+          - test-reports/**
+
+    - name: Execute Data Flow Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/dfa
+        sfdx scanner:run:dfa --format=junit --outfile="test-reports/dfa/junit.xml" --target "./**/*.cls" --projectdir "./" --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: Validate to Test Environment
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://test.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --dry-run --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: Deploy to ST org
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://test.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --post-destructive-changes changed-sources/destructiveChanges/destructiveChanges.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+    - name: Deploy to SIT org
+      uses: docker://rodolforicojr/salesforce-tools
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://test.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --post-destructive-changes changed-sources/destructiveChanges/destructiveChanges.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: Deploy to UAT org
+      uses: docker://rodolforicojr/salesforce-tools
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://test.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --post-destructive-changes changed-sources/destructiveChanges/destructiveChanges.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: Deploy to production org
+      uses: docker://rodolforicojr/salesforce-tools
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://login.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --post-destructive-changes changed-sources/destructiveChanges/destructiveChanges.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Decrypt private key
+      run: |
+        openssl enc -nosalt -aes-256-cbc -d -in keys/server.key.enc -out keys/server.key -base64 -k ${{ secrets.DECRYPTION_KEY }} -md md5
+
+    - name: Generate Delta Changes from master
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "origin/master" --output changed-sources --generate-delta
+
+    - name: Validate to Test Environment
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://test.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --dry-run --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+  dfascanner:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Execute Data Flow Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/dfa
+        sfdx scanner:run:dfa --format=junit --outfile="test-reports/dfa/junit.xml" --target "./**/*.cls" --projectdir "./" --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+
+ develop:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+    - name: Decrypt private key
+      run: |
+        openssl enc -nosalt -aes-256-cbc -d -in keys/server.key.enc -out keys/server.key -base64 -k ${{ secrets.DECRYPTION_KEY }} -md md5
+
+    - name: Generate Delta Changes
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "HEAD~1" --output changed-sources --generate-delta
+
+    - name: Deploy to ST org
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://test.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+  master:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    steps:
+    - name: Decrypt private key
+      run: |
+        openssl enc -nosalt -aes-256-cbc -d -in keys/server.key.enc -out keys/server.key -base64 -k ${{ secrets.DECRYPTION_KEY }} -md md5
+
+    - name: Generate Delta Changes
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "HEAD~1" --output changed-sources --generate-delta
+
+    - name: Deploy to production org
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://login.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --post-destructive-changes changed-sources/destructiveChanges/destructiveChanges.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+  feature:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/pull/feature/')
+    steps:
+    - name: Decrypt private key
+      run: |
+        openssl enc -nosalt -aes-256-cbc -d -in keys/server.key.enc -out keys/server.key -base64 -k ${{ secrets.DECRYPTION_KEY }} -md md5
+
+    - name: Generate Delta Changes from develop
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "origin/develop" --output changed-sources --generate-delta
+
+    - name: Apex Static Code Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/apex
+        sfdx scanner:run --format=junit --outfile="test-reports/apex/junit.xml" --target 'changed-sources/**/*.cls,!./**/lwc/**,!./**/aura/**' --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: Aura Static Code Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/aura
+        sfdx scanner:run --engine "eslint,retire-js" --format=junit --outfile="test-reports/aura/junit.xml" --target changed-sources/**/aura/**/*.js --eslintconfig force-app/main/default/aura/.eslintrc.json --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: LWC Static Code Analysis
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        mkdir -p test-reports/lwc
+        sfdx scanner:run --engine "eslint-lwc,retire-js" --format=junit --outfile="test-reports/lwc/junit.xml" --target changed-sources/**/lwc/**/*.js --eslintconfig force-app/main/default/lwc/.eslintrc.json --normalize-severity --severity-threshold 2
+      with:
+        artifacts:
+          - test-reports/**
+
+    - name: Code formatting verification
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        npm run prettier:verify
+
+    - name: Lint Lightning Web Components / Aura Components
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        npm run lint
+
+    - name: Unit test Lightning Web Components
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        npm install
+        npm run test:unit:coverage
+      with:
+        artifacts:
+          - coverage/**
+          - test-reports/**
+
+    - name: Validate to Test Environment
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        sfdx force:auth:jwt:grant -s -i ${{ secrets.CONSUMERKEY_ORG }} -f keys/server.key -u ${{ secrets.USERNAME_ORG }} -r https://test.salesforce.com
+        mkdir -p test-reports/deployment
+        sf project deploy start --manifest changed-sources/package/package.xml --test-level RunLocalTests --junit --coverage-formatters clover --results-dir test-reports/deployment --api-version 59.0 --dry-run --ignore-conflicts
+      with:
+        artifacts:
+          - test-reports/**
+
+  bugfix:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/pull/bugfix/')
+    steps:
+    - name: Decrypt private key
+      run: |
+        openssl enc -nosalt -aes-256-cbc -d -in keys/server.key.enc -out keys/server.key -base64 -k ${{ secrets.DECRYPTION_KEY }} -md md5
+
+    - name: Generate Delta Changes from develop
+      uses: docker://rodolforicojr/salesforce-tools
+      run: |
+        mkdir changed-sources
+        sfdx sgd:source:delta --to "HEAD" --from "origin/develop" --output changed-sources --generate-d
