@@ -214,7 +214,7 @@ jobs:
         artifacts:
           - test-reports/**
 
- develop:
+  develop:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/develop'
     steps:
