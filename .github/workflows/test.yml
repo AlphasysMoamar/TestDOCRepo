@@ -25,7 +25,7 @@ jobs:
       with:
         lfs: false
         fetch-depth: 0
-  decrypt_key:
+ # decrypt_key:
     runs-on: ubuntu-latest
     steps:
       - name: Decrypt private key
