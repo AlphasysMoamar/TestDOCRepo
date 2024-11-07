@@ -20,12 +20,7 @@ on:
   workflow_dispatch:
 
 jobs:
-    - name: Checkout repository
-      uses: actions/checkout@v2
-      with:
-        lfs: false
-        fetch-depth: 0
- # decrypt_key:
+  decrypt_key:
     runs-on: ubuntu-latest
     steps:
       - name: Decrypt private key
